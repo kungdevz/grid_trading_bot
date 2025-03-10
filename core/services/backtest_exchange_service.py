@@ -1,10 +1,12 @@
 import ccxt, logging, time, os
+from ccxt.base.errors import NetworkError, BaseError, ExchangeError, OrderNotFound
+import ccxt.pro as ccxtpro
 from typing import Optional, Dict, Any, Union
 import pandas as pd
 from config.config_manager import ConfigManager
 from utils.constants import CANDLE_LIMITS, TIMEFRAME_MAPPINGS
 from .exchange_interface import ExchangeInterface
-from .exceptions import UnsupportedExchangeError, DataFetchError, UnsupportedTimeframeError, HistoricalMarketDataFileNotFoundError, UnsupportedPairError
+from .exceptions import UnsupportedExchangeError, DataFetchError, UnsupportedTimeframeError, HistoricalMarketDataFileNotFoundError, UnsupportedPairError, MissingEnvironmentVariableError
 
 class BacktestExchangeService(ExchangeInterface):
     def __init__(self, config_manager: ConfigManager):
@@ -12,13 +14,26 @@ class BacktestExchangeService(ExchangeInterface):
         self.config_manager = config_manager
         self.historical_data_file = self.config_manager.get_historical_data_file()
         self.exchange_name = self.config_manager.get_exchange_name()
+        self.api_key = self._get_env_variable("EXCHANGE_API_KEY")
+        self.secret_key = self._get_env_variable("EXCHANGE_SECRET_KEY")
         self.exchange = self._initialize_exchange()
     
-    def _initialize_exchange(self) -> Optional[ccxt.Exchange]:
+    def _initialize_exchange(self) -> None:
         try:
-            return getattr(ccxt, self.exchange_name)()
+            exchange = getattr(ccxtpro, self.exchange_name)({
+                'apiKey': self.api_key,
+                'secret': self.secret_key,
+                'enableRateLimit': True
+            })
+            return exchange
         except AttributeError:
             raise UnsupportedExchangeError(f"The exchange '{self.exchange_name}' is not supported.")
+        
+    def _get_env_variable(self, key: str) -> str:
+        value = os.getenv(key)
+        if value is None:
+            raise MissingEnvironmentVariableError(f"Missing required environment variable: {key}")
+        return value
     
     def _is_timeframe_supported(self, timeframe: str) -> bool:
         if timeframe not in self.exchange.timeframes:
@@ -37,10 +52,8 @@ class BacktestExchangeService(ExchangeInterface):
         start_date: str, 
         end_date: str
     ) -> pd.DataFrame:
-        if self.historical_data_file:
-            if not os.path.exists(self.historical_data_file):
-                raise HistoricalMarketDataFileNotFoundError(f"Failed to load OHLCV data from file: {self.historical_data_file}")
-    
+        
+        if self.historical_data_file:    
             self.logger.info(f"Loading OHLCV data from file: {self.historical_data_file}")
             return self._load_ohlcv_from_file(self.historical_data_file, start_date, end_date)
         
@@ -49,24 +62,29 @@ class BacktestExchangeService(ExchangeInterface):
 
         if not self._is_timeframe_supported(timeframe):
             raise UnsupportedTimeframeError(f"Timeframe '{timeframe}' is not supported by {self.exchange_name}.")
+        
+        if not os.path.exists(self.historical_data_file):
 
-        self.logger.info(f"Fetching OHLCV data for {pair} from {start_date} to {end_date}")
-        try:
-            since = self.exchange.parse8601(start_date)
-            until = self.exchange.parse8601(end_date)
-            candles_per_request = self._get_candle_limit()
-            total_candles_needed = (until - since) // self._get_timeframe_in_ms(timeframe)
+            self.logger.info(f"Fetching OHLCV data for {pair} from {start_date} to {end_date}")
 
-            if total_candles_needed > candles_per_request:
-                return self._fetch_ohlcv_in_chunks(pair, timeframe, since, until, candles_per_request)
-            else:
-                return self._fetch_ohlcv_single_batch(pair, timeframe, since, until)
-        except ccxt.NetworkError as e:
-            raise DataFetchError(f"Network issue occurred while fetching OHLCV data: {str(e)}")
-        except ccxt.BaseError as e:
-            raise DataFetchError(f"Exchange-specific error occurred: {str(e)}")
-        except Exception as e:
-            raise DataFetchError(f"Failed to fetch OHLCV data {str(e)}.")
+            try:
+
+                since = self.exchange.parse8601(start_date)
+                until = self.exchange.parse8601(end_date)
+                candles_per_request = self._get_candle_limit()
+                total_candles_needed = (until - since) // self._get_timeframe_in_ms(timeframe)
+
+                if total_candles_needed > candles_per_request:
+                    return self._fetch_ohlcv_in_chunks(pair, timeframe, since, until, candles_per_request)
+                else:
+                    return self._fetch_ohlcv_single_batch(pair, timeframe, since, until)
+                
+            except ccxt.NetworkError as e:
+                raise DataFetchError(f"Network issue occurred while fetching OHLCV data: {str(e)}")
+            except ccxt.BaseError as e:
+                raise DataFetchError(f"Exchange-specific error occurred: {str(e)}")
+            except Exception as e:
+                raise DataFetchError(f"Failed to fetch OHLCV data {str(e)}.")
     
     def _load_ohlcv_from_file(
         self, 
